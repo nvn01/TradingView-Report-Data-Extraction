@@ -1,0 +1,19 @@
+{
+    "strategy_name": "Unknown Strategy",
+    "test_period": {
+        "start_date": "",
+        "end_date": ""
+    },
+    "results": [
+        {
+            "chart": "BTCUSDT",
+            "net_profit": "",
+            "total_closed_trades": 0,
+            "percent_profitable": "",
+            "profit_factor": 1.118,
+            "max_drawdown": "",
+            "avg_trade": "",
+            "avg_bars_in_trade": 0
+        }
+    ]
+}
