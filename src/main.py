@@ -22,11 +22,13 @@ for folder in [IMAGES_FOLDER, RAW_IMAGES_FOLDER, DATA_FOLDER]:
 
 def preprocess_image_from_array(image):
     """
-    Crop the region of interest from the image without converting it to grayscale.
+    Crop the region of interest from the image.
 
     Crop Coordinates:
       x = 69, y = 125, width = 1402, height = 235
     If the image is too small for these coordinates, return None.
+
+    NOTE: We do NOT convert to grayscale so that color is preserved.
     """
     x, y, w, h = 69, 125, 1402, 235
     height, width = image.shape[:2]
@@ -34,45 +36,28 @@ def preprocess_image_from_array(image):
         print(f"Image dimensions ({width}x{height}) are smaller than the required crop region ({x+w}x{y+h}).")
         return None
 
+    # Keep the original color
     cropped = image[y:y + h, x:x + w]
     return cropped
 
 
-def extract_text_from_image(image):
+def extract_text_and_data_from_image(image):
     """
-    Run OCR on the processed image using Tesseract with a custom config.
+    Run OCR on the processed image using Tesseract.
+    Returns both the plain text and the word-level OCR data dictionary (unused in parse_text, but kept for reference).
     """
     custom_config = r'--oem 3 --psm 6'
     text = pytesseract.image_to_string(image, config=custom_config)
-    return text
+    ocr_data = pytesseract.image_to_data(image, config=custom_config, output_type=pytesseract.Output.DICT)
+    return text, ocr_data
 
 
-def parse_text(text):
-    r"""
+def parse_text(text, ocr_data, processed):
+    """
     Parses the OCR text to extract report fields.
 
-    Expected OCR output (example):
-
-      WMA + SMI + Donchian Stop (Fresh) ©) @) Deep Backtesting
-      Be Y
-      2024-01-01 — 2025-01-01 (cenerate report}
-      Overview Performance Summary _List of Trades _ Properties
-      Net Profit Total Closed Trades Percent Profitable Profit Factor Max Drawdown Avg Trade Avg # Bars in Trades
-      -44,993.00 USDT -44.99% 2,498 49.40% 0.892 61,514.63 USDT 58.10%  -18.01 USDT 0.04% 15
-
-    The regex below is designed to capture from the data line:
-      Group 1: Net Profit (USDT amount) – ignored
-      Group 2: Net Profit (percentage)
-      Group 3: Total Closed Trades
-      Group 4: Percent Profitable
-      Group 5: Profit Factor
-      Group 6: Max Drawdown (USDT amount) – ignored
-      Group 7: Max Drawdown (percentage)
-      Group 8: Avg Trade (USDT amount) – ignored
-      Group 9: Avg Trade (percentage)
-      Group 10: Avg Bars in Trade
-
-    Note: The pattern now allows for negative values (using -?).
+    We also force the net profit percentage to match the sign of the USDT net profit.
+    If the net profit in USDT is negative, we prepend '-' to the net profit percentage if missing.
     """
     print("DEBUG OCR TEXT:\n", text)
     data = {}
@@ -99,9 +84,13 @@ def parse_text(text):
     if "test_period" not in data:
         data["test_period"] = {"start_date": "", "end_date": ""}
 
-    # 3) Define the regex to capture the numeric fields (allowing for negative values)
+    # 3) Regex to capture the numeric fields (allowing for negative values)
     data_pattern = re.compile(
-        r"^\s*(-?[0-9,\.]+)\s*USDT\s*(-?[0-9\.]+%)\s+(-?[0-9,\.]+)\s+(-?[0-9\.]+%)\s+(-?[0-9\.]+)\s+(-?[0-9,\.]+)\s*USDT\s*(-?[0-9\.]+%)\s+(-?[0-9,\.]+)\s*USDT\s*(-?[0-9\.]+%)\s+(\d+)",
+        r"^\s*(-?[0-9,\.]+)\s*USDT\s*(-?[0-9\.]+%)\s+"
+        r"(-?[0-9,\.]+)\s+(-?[0-9\.]+%)\s+"
+        r"(-?[0-9\.]+)\s+"
+        r"(-?[0-9,\.]+)\s*USDT\s*(-?[0-9\.]+%)\s+"
+        r"(-?[0-9,\.]+)\s*USDT\s*(-?[0-9\.]+%)\s+(\d+)",
         re.IGNORECASE
     )
 
@@ -109,24 +98,45 @@ def parse_text(text):
     for line in lines:
         match = data_pattern.search(line)
         if match:
-            # Assign the extracted fields
-            data["net_profit"] = match.group(2)  # Net Profit percentage
+            # Group(1) => Net Profit (USDT)    e.g. "-41,101.63"
+            # Group(2) => Net Profit (%)       e.g. "41.10%"
+            net_profit_usdt_str = match.group(1).strip()
+            net_profit_pct_str = match.group(2).strip()
+
+            # If the USDT portion is negative but the percentage is not, prepend minus sign
+            if net_profit_usdt_str.startswith('-') and not net_profit_pct_str.startswith('-'):
+                net_profit_pct_str = '-' + net_profit_pct_str
+
+            data["net_profit"] = net_profit_pct_str
+
+            # Group(3) => total closed trades
             try:
                 data["total_closed_trades"] = int(match.group(3).replace(",", ""))
             except ValueError:
                 data["total_closed_trades"] = 0
+
+            # Group(4) => percent profitable
             data["percent_profitable"] = match.group(4)
+
+            # Group(5) => profit factor
             try:
                 data["profit_factor"] = float(match.group(5))
             except ValueError:
                 data["profit_factor"] = 0.0
+
+            # Group(7) => max drawdown (percentage)
             data["max_drawdown"] = match.group(7)
+
+            # Group(9) => avg trade (percentage)
             data["avg_trade"] = match.group(9)
+
+            # Group(10) => avg bars in trade
             try:
                 data["avg_bars_in_trade"] = int(match.group(10))
             except ValueError:
                 data["avg_bars_in_trade"] = 0
-            break
+
+            break  # Stop after finding the first matching line
 
     return data
 
@@ -134,9 +144,9 @@ def parse_text(text):
 def extract_data():
     """
     1. Load all raw images from the RAW_IMAGES_FOLDER.
-    2. Clear both the RAW_IMAGES_FOLDER and the processed images folder (IMAGES_FOLDER) to remove any previous files.
+    2. Clear both the RAW_IMAGES_FOLDER and the processed images folder (IMAGES_FOLDER).
     3. For each uploaded image:
-         - Process it (crop the region of interest).
+         - Crop it (keep color).
          - Save the processed image into IMAGES_FOLDER.
          - Run OCR and parse the data.
          - Extract the coin/chart name from the filename (e.g., "BTCUSDT").
@@ -151,6 +161,7 @@ def extract_data():
         messagebox.showerror("Error", "No images found in the raw images folder.")
         return
 
+    # Read images into memory
     original_images = {}
     for file_path in raw_image_files:
         image = cv2.imread(file_path)
@@ -159,12 +170,14 @@ def extract_data():
         else:
             print(f"Error reading image: {file_path}")
 
+    # Clear out raw images folder
     for file_path in raw_image_files:
         try:
             os.remove(file_path)
         except Exception as e:
             print(f"Could not delete {file_path}: {e}")
 
+    # Clear out processed images folder
     processed_files = [
         os.path.join(IMAGES_FOLDER, f)
         for f in os.listdir(IMAGES_FOLDER)
@@ -191,14 +204,16 @@ def extract_data():
             print(f"Failed to write processed image {processed_path}.")
             continue
 
-        ocr_text = extract_text_from_image(processed)
-        parsed = parse_text(ocr_text)
+        ocr_text, ocr_data = extract_text_and_data_from_image(processed)
+        parsed = parse_text(ocr_text, ocr_data, processed)
 
+        # Store strategy info from the first valid image
         if first_image:
             strategy_info["strategy_name"] = parsed.get("strategy_name", "Unknown Strategy")
             strategy_info["test_period"] = parsed.get("test_period", {"start_date": "", "end_date": ""})
             first_image = False
 
+        # Extract the coin/chart name from the filename (e.g. "BTCUSDT")
         coin_match = re.search(r"([A-Z0-9]+USDT)", filename, re.IGNORECASE)
         if coin_match:
             chart_name = coin_match.group(1).upper()
@@ -222,6 +237,8 @@ def extract_data():
         "test_period": strategy_info.get("test_period", {"start_date": "", "end_date": ""}),
         "results": results
     }
+
+    # Build a safe file name for JSON output
     safe_strategy_name = re.sub(r'[\\/*?:"<>|]', "", final_data["strategy_name"])
     if not safe_strategy_name.strip():
         safe_strategy_name = "Unknown_Strategy"
