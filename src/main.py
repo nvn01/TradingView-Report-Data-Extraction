@@ -10,11 +10,8 @@ import pytesseract
 
 # Define project directories
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-# Processed images folder (for cropped/grayscale images)
 IMAGES_FOLDER = os.path.join(BASE_DIR, "images")
-# Raw images folder (for uploaded images)
 RAW_IMAGES_FOLDER = os.path.join(BASE_DIR, "raw_image")
-# JSON output folder
 DATA_FOLDER = os.path.join(BASE_DIR, "data")
 
 # Ensure the folders exist
@@ -36,16 +33,22 @@ def preprocess_image_from_array(image):
     if width < x + w or height < y + h:
         print(f"Image dimensions ({width}x{height}) are smaller than the required crop region ({x+w}x{y+h}).")
         return None
+
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Optional: Increase contrast or apply thresholding for better OCR accuracy
+    # gray = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)[1]
+
     cropped = gray[y:y + h, x:x + w]
     return cropped
 
 
 def extract_text_from_image(image):
     """
-    Run OCR on the processed image using Tesseract.
+    Run OCR on the processed image using Tesseract with custom config.
     """
-    text = pytesseract.image_to_string(image)
+    # Using --oem 3 and --psm 6 can improve recognition for typical text blocks.
+    custom_config = r'--oem 3 --psm 6'
+    text = pytesseract.image_to_string(image, config=custom_config)
     return text
 
 
@@ -53,25 +56,34 @@ def parse_text(text):
     """
     Parse the OCR text using regex to extract report fields.
     
-    Expected fields:
-      - Strategy Name
-      - Test Period (start and end date)
-      - Net Profit (percentage)
-      - Total Closed Trades (integer)
-      - Percent Profitable (percentage)
-      - Profit Factor (float)
-      - Max Drawdown (percentage)
-      - Avg Trade (percentage)
-      - Avg Bars in Trade (integer)
+    Expected fields (example):
+      - Strategy name
+      - Test period: "2021-04-01 - 2025-01-01"
+      - Net Profit: (only in percentage) e.g. 53.82%
+      - Total Closed Trades: e.g. 2418
+      - Percent Profitable: e.g. 51.49%
+      - Profit Factor: e.g. 1.118
+      - Max Drawdown: (only in percentage) e.g. 28.33%
+      - Avg Trade: (only in percentage) e.g. 0.57%
+      - Avg # Bars in Trade: e.g. 16
     """
+
+    # DEBUG: Print out the raw OCR text so you can see what Tesseract returns
+    print("DEBUG OCR TEXT:\n", text)
+
     data = {}
 
-    strategy_match = re.search(r"Strategy(?: Name)?:\s*(.+)", text, re.IGNORECASE)
+    # 1) Strategy name (e.g., "Strategy: WWA + SMI - Donchian Stop (Fresh)")
+    #    We'll look for lines like "Strategy: Something"
+    strategy_match = re.search(r"(?:Strategy(?: Name)?\s*:\s*)(.*)", text, re.IGNORECASE)
     if strategy_match:
         data["strategy_name"] = strategy_match.group(1).strip()
 
+    # 2) Test period (e.g., "2021-04-01 - 2025-01-01")
+    #    Some OCRs may read the dash differently. This pattern is more flexible.
     test_period_match = re.search(
-        r"Test Period:\s*(\d{4}-\d{2}-\d{2})\s*[-–]\s*(\d{4}-\d{2}-\d{2})", text, re.IGNORECASE
+        r"(\d{4}-\d{2}-\d{2})\s*[-–—]+\s*(\d{4}-\d{2}-\d{2})",
+        text
     )
     if test_period_match:
         data["test_period"] = {
@@ -79,36 +91,50 @@ def parse_text(text):
             "end_date": test_period_match.group(2)
         }
 
-    net_profit_match = re.search(r"Net Profit[:\s]+([-+]?\d+(?:\.\d+)?%)", text, re.IGNORECASE)
+    # 3) Net Profit (sometimes Tesseract might read "Net Profit 53,623.17 USDT 53.82%")
+    #    We just want the percentage part, so we do a minimal ".*?" until we hit a pattern like "53.82%"
+    net_profit_match = re.search(r"Net Profit.*?(\d+(?:\.\d+)?%)", text, re.IGNORECASE)
     if net_profit_match:
         data["net_profit"] = net_profit_match.group(1).strip()
 
-    closed_trades_match = re.search(r"Total Closed Trades[:\s]+(\d+)", text, re.IGNORECASE)
+    # 4) Total Closed Trades
+    #    Tesseract might read it as "Total Closed Trades 2,418" or "Total Closed Trades: 2418"
+    closed_trades_match = re.search(r"Total Closed Trades.*?(\d[\d,\.]*)", text, re.IGNORECASE)
     if closed_trades_match:
-        data["total_closed_trades"] = int(closed_trades_match.group(1).strip())
+        trades_str = closed_trades_match.group(1).replace(",", "")
+        data["total_closed_trades"] = int(float(trades_str))
 
-    percent_profitable_match = re.search(r"Percent Profitable[:\s]+([-+]?\d+(?:\.\d+)?%)", text, re.IGNORECASE)
+    # 5) Percent Profitable
+    #    Could appear as "Percent Profitable 51.49%"
+    percent_profitable_match = re.search(r"Percent\s*Profitable.*?(\d+(?:\.\d+)?%)", text, re.IGNORECASE)
     if percent_profitable_match:
         data["percent_profitable"] = percent_profitable_match.group(1).strip()
 
-    profit_factor_match = re.search(r"Profit Factor[:\s]+(\d+(?:\.\d+)?)", text, re.IGNORECASE)
+    # 6) Profit Factor
+    #    Typically just a float (e.g. "Profit Factor 1.118")
+    profit_factor_match = re.search(r"Profit Factor.*?(\d+(?:\.\d+)?)", text, re.IGNORECASE)
     if profit_factor_match:
         try:
-            data["profit_factor"] = float(profit_factor_match.group(1).strip())
+            data["profit_factor"] = float(profit_factor_match.group(1))
         except ValueError:
             data["profit_factor"] = 0.0
 
-    max_drawdown_match = re.search(r"Max Drawdown[:\s]+([-+]?\d+(?:\.\d+)?%)", text, re.IGNORECASE)
+    # 7) Max Drawdown
+    #    e.g. "Max Drawdown 28,335.44 USDT 49.12%"
+    max_drawdown_match = re.search(r"Max Drawdown.*?(\d+(?:\.\d+)?%)", text, re.IGNORECASE)
     if max_drawdown_match:
         data["max_drawdown"] = max_drawdown_match.group(1).strip()
 
-    avg_trade_match = re.search(r"Avg Trade[:\s]+([-+]?\d+(?:\.\d+)?%)", text, re.IGNORECASE)
+    # 8) Avg Trade
+    #    e.g. "Avg Trade 22.17 USDT 0.57%"
+    avg_trade_match = re.search(r"Avg Trade.*?(\d+(?:\.\d+)?%)", text, re.IGNORECASE)
     if avg_trade_match:
         data["avg_trade"] = avg_trade_match.group(1).strip()
 
-    avg_bars_match = re.search(r"Avg Bars in Trade[:\s]+(\d+)", text, re.IGNORECASE)
+    # 9) Avg Bars in Trade (or "Avg # Bars in Trade")
+    avg_bars_match = re.search(r"Avg.*Bars in Trade.*?(\d+)", text, re.IGNORECASE)
     if avg_bars_match:
-        data["avg_bars_in_trade"] = int(avg_bars_match.group(1).strip())
+        data["avg_bars_in_trade"] = int(avg_bars_match.group(1))
 
     return data
 
@@ -121,7 +147,7 @@ def extract_data():
          - Process it (convert to grayscale and crop).
          - Save the processed image into IMAGES_FOLDER.
          - Run OCR and parse the data.
-         - Extract the coin/chart name from the filename.
+         - Extract the coin/chart name from the filename (like "BTCUSDT").
     4. Assemble the parsed data into a JSON file and save it in the DATA_FOLDER.
     """
     # Get raw image files
@@ -189,7 +215,7 @@ def extract_data():
             first_image = False
 
         # Extract coin/chart name from the filename (e.g., "BTCUSDT")
-        coin_match = re.search(r"([A-Z0-9]+USDT)", filename)
+        coin_match = re.search(r"([A-Z0-9]+USDT)", filename, re.IGNORECASE)
         if coin_match:
             chart_name = coin_match.group(1)
         else:
