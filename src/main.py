@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import cv2
+import numpy as np
 import pytesseract
 
 # Define project directories
@@ -19,32 +20,88 @@ for folder in [IMAGES_FOLDER, RAW_IMAGES_FOLDER, DATA_FOLDER]:
     if not os.path.exists(folder):
         os.makedirs(folder)
 
+# Saved adjustment parameters
+ADJUSTMENTS = {
+    'brightness': 0,       # add 0 to pixel values
+    'contrast': 1.0,       # multiply by 1.0 (no change)
+    'gamma': 0.01,         # gamma correction factor
+    'grayscale': False,    # keep color (if True, convert to grayscale)
+    'saturation': 300,     # saturation percentage (300 means 3x)
+    'sharpen': 100,        # sharpening factor (100 -> classic sharpen)
+    'thresholding': False, # if True, apply thresholding
+    'threshold_value': 235
+}
+
+
+def adjust_image(image, adjustments):
+    """
+    Apply image adjustments:
+      - brightness/contrast
+      - gamma correction
+      - saturation boost (if color)
+      - sharpening filter
+      - optional thresholding
+    """
+    # 1. Brightness and contrast adjustment: new_image = image * contrast + brightness
+    new_image = cv2.convertScaleAbs(image, alpha=adjustments['contrast'], beta=adjustments['brightness'])
+
+    # 2. Gamma correction (build a lookup table)
+    gamma = adjustments['gamma']
+    if gamma != 1.0:
+        invGamma = 1.0 / gamma  # for example, gamma=0.01 leads to a high invGamma
+        table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+        new_image = cv2.LUT(new_image, table)
+
+    # 3. Saturation adjustment (if not converting to grayscale)
+    if not adjustments['grayscale']:
+        hsv = cv2.cvtColor(new_image, cv2.COLOR_BGR2HSV)
+        sat_factor = adjustments['saturation'] / 100.0  # e.g. 300 -> 3.0
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_factor, 0, 255).astype(np.uint8)
+        new_image = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    else:
+        new_image = cv2.cvtColor(new_image, cv2.COLOR_BGR2GRAY)
+
+    # 4. Sharpening filter: create a kernel based on the sharpen factor.
+    factor = adjustments['sharpen'] / 100.0  # e.g. 100 -> 1.0
+    kernel = np.array([[0, -factor, 0],
+                       [-factor, 1 + 4 * factor, -factor],
+                       [0, -factor, 0]])
+    new_image = cv2.filter2D(new_image, -1, kernel)
+
+    # 5. Optional thresholding: if enabled, convert to grayscale (if needed) and apply threshold.
+    if adjustments['thresholding']:
+        if len(new_image.shape) == 3:
+            gray = cv2.cvtColor(new_image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = new_image
+        _, new_image = cv2.threshold(gray, adjustments['threshold_value'], 255, cv2.THRESH_BINARY)
+
+    return new_image
+
 
 def preprocess_image_from_array(image):
     """
-    Crop the region of interest from the image.
+    Crop the region of interest from the image and apply adjustments.
 
     Crop Coordinates:
       x = 69, y = 125, width = 1402, height = 235
-    If the image is too small for these coordinates, return None.
-
-    NOTE: We do NOT convert to grayscale so that color is preserved.
+    If the image is too small, return None.
     """
     x, y, w, h = 69, 125, 1402, 235
     height, width = image.shape[:2]
     if width < x + w or height < y + h:
-        print(f"Image dimensions ({width}x{height}) are smaller than the required crop region ({x+w}x{y+h}).")
+        print(f"Image dimensions ({width}x{height}) are smaller than required crop region ({x+w}x{y+h}).")
         return None
 
-    # Keep the original color
     cropped = image[y:y + h, x:x + w]
-    return cropped
+    adjusted = adjust_image(cropped, ADJUSTMENTS)
+    return adjusted
 
 
 def extract_text_and_data_from_image(image):
     """
     Run OCR on the processed image using Tesseract.
-    Returns both the plain text and the word-level OCR data dictionary (unused in parse_text, but kept for reference).
+    Returns both the plain text and the word-level OCR data dictionary.
     """
     custom_config = r'--oem 3 --psm 6'
     text = pytesseract.image_to_string(image, config=custom_config)
@@ -54,18 +111,19 @@ def extract_text_and_data_from_image(image):
 
 def parse_text(text, ocr_data, processed):
     """
-    Parses the OCR text to extract report fields.
-
-    We also force the net profit percentage to match the sign of the USDT net profit.
-    If the net profit in USDT is negative, we prepend '-' to the net profit percentage if missing.
+    Parse the OCR text to extract report fields.
+    - Extract the strategy name and test period from any lines.
+    - Look for a candidate numeric-data line (by scanning from the bottom)
+      then clean it and apply an improved regex pattern.
+    Returns a dictionary with extracted data or {} if not found.
     """
     print("DEBUG OCR TEXT:\n", text)
     data = {}
 
-    # Split OCR text into non-empty lines
+    # Split text into non-empty lines.
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    # 1) Try to capture the strategy name from a line containing "Deep Backtesting"
+    # 1) Get strategy name (from line containing "Deep Backtesting")
     for line in lines:
         if "Deep Backtesting" in line:
             left_part = line.split("Deep Backtesting")[0].strip()
@@ -75,7 +133,7 @@ def parse_text(text, ocr_data, processed):
     if "strategy_name" not in data:
         data["strategy_name"] = "Unknown Strategy"
 
-    # 2) Parse the date range (e.g. "2024-01-01 — 2025-01-01")
+    # 2) Try to parse a test period (e.g., "2024-01-01 — 2025-01-01")
     for line in lines:
         m = re.search(r"(\d{4}-\d{2}-\d{2})\s*[-–—]+\s*(\d{4}-\d{2}-\d{2})", line)
         if m:
@@ -84,73 +142,84 @@ def parse_text(text, ocr_data, processed):
     if "test_period" not in data:
         data["test_period"] = {"start_date": "", "end_date": ""}
 
-    # 3) Regex to capture the numeric fields (allowing for negative values)
+    # 3) Look for the candidate numeric data line by scanning from the bottom.
+    candidate_line = None
+    for line in reversed(lines):
+        if "USDT" in line and "%" in line and re.search(r'\d', line):
+            candidate_line = line
+            break
+
+    if not candidate_line:
+        return {}  # No numeric data found
+
+    # Clean the candidate line: remove stray characters and replace fancy quotes/dashes.
+    clean_line = candidate_line.replace("@", "").replace("=", "").replace("‘", "").replace("’", "")
+    clean_line = clean_line.replace("—", "-").strip()
+
+    # Improved regex pattern with optional trailing period on percentage fields.
     data_pattern = re.compile(
-        r"^\s*(-?[0-9,\.]+)\s*USDT\s*(-?[0-9\.]+%)\s+"
-        r"(-?[0-9,\.]+)\s+(-?[0-9\.]+%)\s+"
+        r"^\s*(-?[0-9,\.]+)\s*USDT\s*(-?[0-9\.]+%)(?:\.?)\s+"
+        r"(-?[0-9,\.]+)\s+(-?[0-9\.]+%)(?:\.?)\s+"
         r"(-?[0-9\.]+)\s+"
-        r"(-?[0-9,\.]+)\s*USDT\s*(-?[0-9\.]+%)\s+"
-        r"(-?[0-9,\.]+)\s*USDT\s*(-?[0-9\.]+%)\s+(\d+)",
-        re.IGNORECASE
+        r"(-?[0-9,\.]+)\s*USDT\s*(-?[0-9\.]+%)(?:\.?)\s+"
+        r"(-?[0-9,\.]+)\s*USDT\s*(-?[0-9\.]+%)(?:\.?)\s+(\d+)"
     )
 
-    # Look for a line that matches the data pattern
-    for line in lines:
-        match = data_pattern.search(line)
-        if match:
-            # Group(1) => Net Profit (USDT)    e.g. "-41,101.63"
-            # Group(2) => Net Profit (%)       e.g. "41.10%"
-            net_profit_usdt_str = match.group(1).strip()
-            net_profit_pct_str = match.group(2).strip()
+    match = data_pattern.search(clean_line)
+    if match:
+        # Group mappings:
+        # group1: net profit USDT (unused)
+        # group2: net profit percentage
+        # group3: total closed trades
+        # group4: percent profitable
+        # group5: profit factor
+        # group6: (unused USDT value)
+        # group7: max drawdown percentage
+        # group8: (unused USDT value)
+        # group9: avg trade percentage
+        # group10: avg bars in trade
+        net_profit_usdt_str = match.group(1).strip()
+        net_profit_pct_str = match.group(2).strip()
+        # If the USDT net profit is negative but the percentage field isn’t, fix it.
+        if net_profit_usdt_str.startswith('-') and not net_profit_pct_str.startswith('-'):
+            net_profit_pct_str = '-' + net_profit_pct_str
+        data["net_profit"] = net_profit_pct_str
 
-            # If the USDT portion is negative but the percentage is not, prepend minus sign
-            if net_profit_usdt_str.startswith('-') and not net_profit_pct_str.startswith('-'):
-                net_profit_pct_str = '-' + net_profit_pct_str
+        try:
+            data["total_closed_trades"] = int(match.group(3).replace(",", ""))
+        except ValueError:
+            data["total_closed_trades"] = 0
 
-            data["net_profit"] = net_profit_pct_str
+        data["percent_profitable"] = match.group(4).strip()
 
-            # Group(3) => total closed trades
-            try:
-                data["total_closed_trades"] = int(match.group(3).replace(",", ""))
-            except ValueError:
-                data["total_closed_trades"] = 0
+        try:
+            data["profit_factor"] = float(match.group(5))
+        except ValueError:
+            data["profit_factor"] = 0.0
 
-            # Group(4) => percent profitable
-            data["percent_profitable"] = match.group(4)
+        data["max_drawdown"] = match.group(7).strip()
+        data["avg_trade"] = match.group(9).strip()
 
-            # Group(5) => profit factor
-            try:
-                data["profit_factor"] = float(match.group(5))
-            except ValueError:
-                data["profit_factor"] = 0.0
+        try:
+            data["avg_bars_in_trade"] = int(match.group(10))
+        except ValueError:
+            data["avg_bars_in_trade"] = 0
 
-            # Group(7) => max drawdown (percentage)
-            data["max_drawdown"] = match.group(7)
-
-            # Group(9) => avg trade (percentage)
-            data["avg_trade"] = match.group(9)
-
-            # Group(10) => avg bars in trade
-            try:
-                data["avg_bars_in_trade"] = int(match.group(10))
-            except ValueError:
-                data["avg_bars_in_trade"] = 0
-
-            break  # Stop after finding the first matching line
-
-    return data
+        return data
+    else:
+        return {}  # No match found
 
 
 def extract_data():
     """
     1. Load all raw images from the RAW_IMAGES_FOLDER.
-    2. Clear both the RAW_IMAGES_FOLDER and the processed images folder (IMAGES_FOLDER).
-    3. For each uploaded image:
-         - Crop it (keep color).
+    2. Clear both RAW_IMAGES_FOLDER and processed images folder (IMAGES_FOLDER).
+    3. For each image:
+         - Crop and adjust it.
          - Save the processed image into IMAGES_FOLDER.
          - Run OCR and parse the data.
-         - Extract the coin/chart name from the filename (e.g., "BTCUSDT").
-    4. Assemble the parsed data into a JSON file and save it in the DATA_FOLDER.
+         - Extract the chart name from the filename (e.g., "BTCUSDT").
+    4. Assemble valid parsed data into structured JSON and save it in the DATA_FOLDER.
     """
     raw_image_files = [
         os.path.join(RAW_IMAGES_FOLDER, f)
@@ -161,7 +230,7 @@ def extract_data():
         messagebox.showerror("Error", "No images found in the raw images folder.")
         return
 
-    # Read images into memory
+    # Read images into memory.
     original_images = {}
     for file_path in raw_image_files:
         image = cv2.imread(file_path)
@@ -170,14 +239,14 @@ def extract_data():
         else:
             print(f"Error reading image: {file_path}")
 
-    # Clear out raw images folder
+    # Clear out raw images folder.
     for file_path in raw_image_files:
         try:
             os.remove(file_path)
         except Exception as e:
             print(f"Could not delete {file_path}: {e}")
 
-    # Clear out processed images folder
+    # Clear out processed images folder.
     processed_files = [
         os.path.join(IMAGES_FOLDER, f)
         for f in os.listdir(IMAGES_FOLDER)
@@ -207,13 +276,18 @@ def extract_data():
         ocr_text, ocr_data = extract_text_and_data_from_image(processed)
         parsed = parse_text(ocr_text, ocr_data, processed)
 
-        # Store strategy info from the first valid image
+        # Skip chart if numeric data couldn’t be parsed.
+        if not parsed or "net_profit" not in parsed or parsed["net_profit"] == "":
+            print(f"Skipping chart from {filename} because no numeric data was extracted.")
+            continue
+
+        # Store strategy info from the first valid image.
         if first_image:
             strategy_info["strategy_name"] = parsed.get("strategy_name", "Unknown Strategy")
             strategy_info["test_period"] = parsed.get("test_period", {"start_date": "", "end_date": ""})
             first_image = False
 
-        # Extract the coin/chart name from the filename (e.g. "BTCUSDT")
+        # Extract the coin/chart name from the filename (e.g., "BTCUSDT").
         coin_match = re.search(r"([A-Z0-9]+USDT)", filename, re.IGNORECASE)
         if coin_match:
             chart_name = coin_match.group(1).upper()
@@ -238,7 +312,7 @@ def extract_data():
         "results": results
     }
 
-    # Build a safe file name for JSON output
+    # Build a safe filename for JSON output using the strategy name.
     safe_strategy_name = re.sub(r'[\\/*?:"<>|]', "", final_data["strategy_name"])
     if not safe_strategy_name.strip():
         safe_strategy_name = "Unknown_Strategy"
