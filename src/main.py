@@ -26,8 +26,8 @@ def preprocess_image_from_array(image):
 
     Crop Coordinates:
       x = 69, y = 125, width = 1402, height = 235
-
     If the image is too small for these coordinates, return None.
+
     NOTE: We do NOT convert to grayscale so that color is preserved.
     """
     x, y, w, h = 69, 125, 1402, 235
@@ -36,6 +36,7 @@ def preprocess_image_from_array(image):
         print(f"Image dimensions ({width}x{height}) are smaller than the required crop region ({x+w}x{y+h}).")
         return None
 
+    # Keep the original color
     cropped = image[y:y + h, x:x + w]
     return cropped
 
@@ -95,38 +96,38 @@ def parse_text(text, ocr_data, processed):
     for line in lines:
         match = data_pattern.search(line)
         if match:
-            # Use the extracted net profit percentage directly as given by OCR
+            # Directly use the net profit percentage as extracted by OCR
             net_profit_pct_str = match.group(2).strip()
             data["net_profit"] = net_profit_pct_str
 
-            # Extract total closed trades
+            # Group(3) => total closed trades
             try:
                 data["total_closed_trades"] = int(match.group(3).replace(",", ""))
             except ValueError:
                 data["total_closed_trades"] = 0
 
-            # Extract percent profitable
+            # Group(4) => percent profitable
             data["percent_profitable"] = match.group(4)
 
-            # Extract profit factor
+            # Group(5) => profit factor
             try:
                 data["profit_factor"] = float(match.group(5))
             except ValueError:
                 data["profit_factor"] = 0.0
 
-            # Extract max drawdown (as percentage)
+            # Group(7) => max drawdown (percentage)
             data["max_drawdown"] = match.group(7)
 
-            # Extract avg trade (as percentage)
+            # Group(9) => avg trade (percentage)
             data["avg_trade"] = match.group(9)
 
-            # Extract avg bars in trade
+            # Group(10) => avg bars in trade
             try:
                 data["avg_bars_in_trade"] = int(match.group(10))
             except ValueError:
                 data["avg_bars_in_trade"] = 0
 
-            break  # Stop after the first matching line
+            break  # Stop after finding the first matching line
 
     return data
 
@@ -136,7 +137,7 @@ def extract_data():
     1. Load all raw images from the RAW_IMAGES_FOLDER.
     2. Clear both the RAW_IMAGES_FOLDER and the processed images folder (IMAGES_FOLDER).
     3. For each uploaded image:
-         - Crop it (keeping the original color).
+         - Crop it (keep color).
          - Save the processed image into IMAGES_FOLDER.
          - Run OCR and parse the data.
          - Extract the coin/chart name from the filename (e.g., "BTCUSDT").
@@ -203,7 +204,7 @@ def extract_data():
             strategy_info["test_period"] = parsed.get("test_period", {"start_date": "", "end_date": ""})
             first_image = False
 
-        # Extract the coin/chart name from the filename (e.g., "BTCUSDT")
+        # Extract the coin/chart name from the filename (e.g. "BTCUSDT")
         coin_match = re.search(r"([A-Z0-9]+USDT)", filename, re.IGNORECASE)
         if coin_match:
             chart_name = coin_match.group(1).upper()
@@ -228,7 +229,7 @@ def extract_data():
         "results": results
     }
 
-    # Build a safe file name for JSON output using the strategy name
+    # Build a safe file name for JSON output
     safe_strategy_name = re.sub(r'[\\/*?:"<>|]', "", final_data["strategy_name"])
     if not safe_strategy_name.strip():
         safe_strategy_name = "Unknown_Strategy"
