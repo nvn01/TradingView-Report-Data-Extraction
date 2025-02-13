@@ -35,7 +35,7 @@ def preprocess_image_from_array(image):
         return None
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Optional: Increase contrast or apply thresholding for better OCR accuracy
+    # Optional thresholding for better OCR:
     # gray = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)[1]
 
     cropped = gray[y:y + h, x:x + w]
@@ -46,7 +46,6 @@ def extract_text_from_image(image):
     """
     Run OCR on the processed image using Tesseract with custom config.
     """
-    # Using --oem 3 and --psm 6 can improve recognition for typical text blocks.
     custom_config = r'--oem 3 --psm 6'
     text = pytesseract.image_to_string(image, config=custom_config)
     return text
@@ -54,87 +53,114 @@ def extract_text_from_image(image):
 
 def parse_text(text):
     """
-    Parse the OCR text using regex to extract report fields.
-    
-    Expected fields (example):
-      - Strategy name
-      - Test period: "2021-04-01 - 2025-01-01"
-      - Net Profit: (only in percentage) e.g. 53.82%
-      - Total Closed Trades: e.g. 2418
-      - Percent Profitable: e.g. 51.49%
-      - Profit Factor: e.g. 1.118
-      - Max Drawdown: (only in percentage) e.g. 28.33%
-      - Avg Trade: (only in percentage) e.g. 0.57%
-      - Avg # Bars in Trade: e.g. 16
+    Because your OCR shows something like:
+
+      (header line)
+      Net Profit Total Closed Trades Percent Profitable Profit Factor Max Drawdown Avg Trade Avg # Bars in Trades
+
+      (data line)
+      8,431.45 USDT 8.43% 2,381 50.40% 1.02 26,194.08 USDT 25.53% 3.54 USDT 0.07% 16
+
+    We need a line-by-line approach:
+      1) Possibly parse strategy name from "WMA + SMI + Donchian Stop (Fresh)" line
+      2) Parse the date range "2024-01-01 — 2025-01-01"
+      3) Find the line that starts with digits (the data line) and use a single big regex to extract each field in order.
+
+    The big regex pattern for the data line (example):
+      ^\s*([0-9,\.]+)\s*USDT\s*([0-9\.]+%)\s+([0-9,\.]+)\s+([0-9\.]+%)\s+([0-9\.]+)\s+([0-9,\.]+)\s*USDT\s*([0-9\.]+%)\s+([0-9,\.]+)\s*USDT\s*([0-9\.]+%)\s+(\d+)
+
+    That captures:
+      group(1) -> 8,431.45
+      group(2) -> 8.43%
+      group(3) -> 2,381
+      group(4) -> 50.40%
+      group(5) -> 1.02
+      group(6) -> 26,194.08
+      group(7) -> 25.53%
+      group(8) -> 3.54
+      group(9) -> 0.07%
+      group(10) -> 16
+
+    But you only need:
+      net_profit (only in %) -> group(2)
+      total_closed_trades -> group(3)
+      percent_profitable -> group(4)
+      profit_factor -> group(5)
+      max_drawdown (only in %) -> group(7)
+      avg_trade (only in %) -> group(9)
+      avg_bars_in_trade -> group(10)
     """
 
-    # DEBUG: Print out the raw OCR text so you can see what Tesseract returns
+    # Debug: Print the raw OCR text
     print("DEBUG OCR TEXT:\n", text)
 
     data = {}
 
-    # 1) Strategy name (e.g., "Strategy: WWA + SMI - Donchian Stop (Fresh)")
-    #    We'll look for lines like "Strategy: Something"
-    strategy_match = re.search(r"(?:Strategy(?: Name)?\s*:\s*)(.*)", text, re.IGNORECASE)
-    if strategy_match:
-        data["strategy_name"] = strategy_match.group(1).strip()
+    # Split into lines (strip out empty lines)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    # 2) Test period (e.g., "2021-04-01 - 2025-01-01")
-    #    Some OCRs may read the dash differently. This pattern is more flexible.
-    test_period_match = re.search(
-        r"(\d{4}-\d{2}-\d{2})\s*[-–—]+\s*(\d{4}-\d{2}-\d{2})",
-        text
+    # 1) Try to parse the "WMA + SMI + Donchian Stop (Fresh)" as the strategy name
+    #    For example, if the line ends with "Deep Backtesting"
+    #    We'll look for something containing "Donchian Stop" near "Deep Backtesting"
+    #    If your text is always consistent, you can do simpler patterns.
+    for line in lines:
+        # Example: "WMA + SMI + Donchian Stop (Fresh) ©) @) Deep Backtesting"
+        # We'll capture everything up to "Deep Backtesting"
+        if "Deep Backtesting" in line:
+            # A quick attempt: split by "Deep Backtesting" and keep left part
+            left_part = line.split("Deep Backtesting")[0].strip()
+            # Remove trailing ©) @) if needed
+            left_part = re.sub(r"[©)@]+$", "", left_part).strip()
+            data["strategy_name"] = left_part
+            break
+
+    # If we didn't find a strategy name above, default to "Unknown Strategy"
+    if "strategy_name" not in data:
+        data["strategy_name"] = "Unknown Strategy"
+
+    # 2) Parse the date range "2024-01-01 — 2025-01-01"
+    #    Some OCR may read the dash differently (— or -).
+    for line in lines:
+        m = re.search(r"(\d{4}-\d{2}-\d{2})\s*[-–—]+\s*(\d{4}-\d{2}-\d{2})", line)
+        if m:
+            data["test_period"] = {
+                "start_date": m.group(1),
+                "end_date": m.group(2)
+            }
+            break
+
+    # If not found, set an empty date range
+    if "test_period" not in data:
+        data["test_period"] = {"start_date": "", "end_date": ""}
+
+    # 3) Parse the main data line (which typically starts with a digit, e.g. "8,431.45 USDT 8.43% ...")
+    #    We'll define a big regex for that line
+    data_pattern = re.compile(
+        r"^\s*([0-9,\.]+)\s*USDT\s*([0-9\.]+%)\s+([0-9,\.]+)\s+([0-9\.]+%)\s+([0-9\.]+)\s+([0-9,\.]+)\s*USDT\s*([0-9\.]+%)\s+([0-9,\.]+)\s*USDT\s*([0-9\.]+%)\s+(\d+)",
+        re.IGNORECASE
     )
-    if test_period_match:
-        data["test_period"] = {
-            "start_date": test_period_match.group(1),
-            "end_date": test_period_match.group(2)
-        }
 
-    # 3) Net Profit (sometimes Tesseract might read "Net Profit 53,623.17 USDT 53.82%")
-    #    We just want the percentage part, so we do a minimal ".*?" until we hit a pattern like "53.82%"
-    net_profit_match = re.search(r"Net Profit.*?(\d+(?:\.\d+)?%)", text, re.IGNORECASE)
-    if net_profit_match:
-        data["net_profit"] = net_profit_match.group(1).strip()
-
-    # 4) Total Closed Trades
-    #    Tesseract might read it as "Total Closed Trades 2,418" or "Total Closed Trades: 2418"
-    closed_trades_match = re.search(r"Total Closed Trades.*?(\d[\d,\.]*)", text, re.IGNORECASE)
-    if closed_trades_match:
-        trades_str = closed_trades_match.group(1).replace(",", "")
-        data["total_closed_trades"] = int(float(trades_str))
-
-    # 5) Percent Profitable
-    #    Could appear as "Percent Profitable 51.49%"
-    percent_profitable_match = re.search(r"Percent\s*Profitable.*?(\d+(?:\.\d+)?%)", text, re.IGNORECASE)
-    if percent_profitable_match:
-        data["percent_profitable"] = percent_profitable_match.group(1).strip()
-
-    # 6) Profit Factor
-    #    Typically just a float (e.g. "Profit Factor 1.118")
-    profit_factor_match = re.search(r"Profit Factor.*?(\d+(?:\.\d+)?)", text, re.IGNORECASE)
-    if profit_factor_match:
-        try:
-            data["profit_factor"] = float(profit_factor_match.group(1))
-        except ValueError:
-            data["profit_factor"] = 0.0
-
-    # 7) Max Drawdown
-    #    e.g. "Max Drawdown 28,335.44 USDT 49.12%"
-    max_drawdown_match = re.search(r"Max Drawdown.*?(\d+(?:\.\d+)?%)", text, re.IGNORECASE)
-    if max_drawdown_match:
-        data["max_drawdown"] = max_drawdown_match.group(1).strip()
-
-    # 8) Avg Trade
-    #    e.g. "Avg Trade 22.17 USDT 0.57%"
-    avg_trade_match = re.search(r"Avg Trade.*?(\d+(?:\.\d+)?%)", text, re.IGNORECASE)
-    if avg_trade_match:
-        data["avg_trade"] = avg_trade_match.group(1).strip()
-
-    # 9) Avg Bars in Trade (or "Avg # Bars in Trade")
-    avg_bars_match = re.search(r"Avg.*Bars in Trade.*?(\d+)", text, re.IGNORECASE)
-    if avg_bars_match:
-        data["avg_bars_in_trade"] = int(avg_bars_match.group(1))
+    for line in lines:
+        match = data_pattern.search(line)
+        if match:
+            # net_profit_pct
+            data["net_profit"] = match.group(2)  # e.g. "8.43%"
+            # total_closed_trades
+            data["total_closed_trades"] = int(match.group(3).replace(",", ""))  # e.g. "2,381" -> 2381
+            # percent_profitable
+            data["percent_profitable"] = match.group(4)  # e.g. "50.40%"
+            # profit_factor
+            try:
+                data["profit_factor"] = float(match.group(5))
+            except ValueError:
+                data["profit_factor"] = 0.0
+            # max_drawdown_pct
+            data["max_drawdown"] = match.group(7)  # e.g. "25.53%"
+            # avg_trade_pct
+            data["avg_trade"] = match.group(9)  # e.g. "0.07%"
+            # avg_bars_in_trade
+            data["avg_bars_in_trade"] = int(match.group(10))  # e.g. "16"
+            break  # Stop once we've parsed the data line
 
     return data
 
@@ -147,7 +173,7 @@ def extract_data():
          - Process it (convert to grayscale and crop).
          - Save the processed image into IMAGES_FOLDER.
          - Run OCR and parse the data.
-         - Extract the coin/chart name from the filename (like "BTCUSDT").
+         - Extract the coin/chart name from the filename (e.g., "BTCUSDT").
     4. Assemble the parsed data into a JSON file and save it in the DATA_FOLDER.
     """
     # Get raw image files
@@ -209,6 +235,7 @@ def extract_data():
         ocr_text = extract_text_from_image(processed)
         parsed = parse_text(ocr_text)
 
+        # For the first image, set overall strategy_name & test_period
         if first_image:
             strategy_info["strategy_name"] = parsed.get("strategy_name", "Unknown Strategy")
             strategy_info["test_period"] = parsed.get("test_period", {"start_date": "", "end_date": ""})
@@ -217,7 +244,7 @@ def extract_data():
         # Extract coin/chart name from the filename (e.g., "BTCUSDT")
         coin_match = re.search(r"([A-Z0-9]+USDT)", filename, re.IGNORECASE)
         if coin_match:
-            chart_name = coin_match.group(1)
+            chart_name = coin_match.group(1).upper()
         else:
             chart_name = os.path.splitext(filename)[0]
 
@@ -239,7 +266,10 @@ def extract_data():
         "test_period": strategy_info.get("test_period", {"start_date": "", "end_date": ""}),
         "results": results
     }
+    # Create a safe filename
     safe_strategy_name = re.sub(r'[\\/*?:"<>|]', "", final_data["strategy_name"])
+    if not safe_strategy_name.strip():
+        safe_strategy_name = "Unknown_Strategy"
     output_filename = f"{safe_strategy_name.replace(' ', '_')}.json"
     output_path = os.path.join(DATA_FOLDER, output_filename)
 
