@@ -22,7 +22,7 @@ for folder in [IMAGES_FOLDER, RAW_IMAGES_FOLDER, DATA_FOLDER]:
 
 def preprocess_image_from_array(image):
     """
-    Convert the image to grayscale and crop the region of interest.
+    Crop the region of interest from the image without converting it to grayscale.
 
     Crop Coordinates:
       x = 69, y = 125, width = 1402, height = 235
@@ -34,11 +34,7 @@ def preprocess_image_from_array(image):
         print(f"Image dimensions ({width}x{height}) are smaller than the required crop region ({x+w}x{y+h}).")
         return None
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Optional: Increase contrast or apply thresholding for better OCR accuracy
-    # gray = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)[1]
-
-    cropped = gray[y:y + h, x:x + w]
+    cropped = image[y:y + h, x:x + w]
     return cropped
 
 
@@ -140,7 +136,7 @@ def extract_data():
     1. Load all raw images from the RAW_IMAGES_FOLDER.
     2. Clear both the RAW_IMAGES_FOLDER and the processed images folder (IMAGES_FOLDER) to remove any previous files.
     3. For each uploaded image:
-         - Process it (convert to grayscale and crop).
+         - Process it (crop the region of interest).
          - Save the processed image into IMAGES_FOLDER.
          - Run OCR and parse the data.
          - Extract the coin/chart name from the filename (e.g., "BTCUSDT").
